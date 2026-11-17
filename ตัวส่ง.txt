@@ -1,0 +1,230 @@
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// -------- Keypad PCF8574 --------
+const uint8_t KEYPAD_ADDRESS = 0x20;
+
+const uint8_t rowPins[4] = {1,6,5,3};
+const uint8_t colPins[3] = {2,0,4};
+
+const char keys[4][3] = {
+{'1','2','3'},
+{'4','5','6'},
+{'7','8','9'},
+{'*','0','#'}
+};
+
+// -------- Buttons GPIO --------
+#define BTN_OK     32
+#define BTN_CANCEL 33
+#define BTN_BACK   25
+#define BTN_NEXT   26
+
+// -------- ESP NOW --------
+uint8_t machineMAC[] = {0xB0,0xCB,0xD8,0xC6,0xE8,0xD8};
+
+typedef struct{
+  char key;
+}KeyData;
+
+typedef struct{
+  char line1[17];
+  char line2[17];
+}DisplayData;
+
+KeyData sendKey;
+DisplayData displayData;
+
+char lastKey='N';
+
+// -------- Button State --------
+bool lastOkState=HIGH;
+bool lastCancelState=HIGH;
+bool lastBackState=HIGH;
+bool lastNextState=HIGH;
+
+// -------- RECEIVE LCD FROM MACHINE --------
+void OnDataRecv(const esp_now_recv_info *info,const uint8_t *data,int len){
+
+  memcpy(&displayData,data,sizeof(displayData));
+
+  display.clearDisplay();
+  display.setTextSize(2);
+
+  display.setCursor(0,0);
+  display.println(displayData.line1);
+
+  display.setCursor(0,32);
+  display.println(displayData.line2);
+
+  display.display();
+}
+
+// -------- SEND STATUS --------
+void OnDataSent(const wifi_tx_info_t *info,esp_now_send_status_t status){
+
+  Serial.print("Send Status: ");
+
+  if(status==ESP_NOW_SEND_SUCCESS)
+    Serial.println("Success");
+  else
+    Serial.println("Fail");
+}
+
+// -------- READ KEYPAD --------
+char readKeypad(){
+
+  for(int r=0;r<4;r++){
+
+    uint8_t rowData=0xFF;
+    rowData&=~(1<<rowPins[r]);
+
+    Wire.beginTransmission(KEYPAD_ADDRESS);
+    Wire.write(rowData);
+    Wire.endTransmission();
+
+    Wire.requestFrom(KEYPAD_ADDRESS,1);
+
+    if(Wire.available()){
+
+      uint8_t colData=Wire.read();
+
+      for(int c=0;c<3;c++){
+
+        if(!(colData&(1<<colPins[c]))){
+
+          delay(20);
+
+          Wire.beginTransmission(KEYPAD_ADDRESS);
+          Wire.write(0xFF);
+          Wire.endTransmission();
+
+          return keys[r][c];
+        }
+      }
+    }
+  }
+
+  Wire.beginTransmission(KEYPAD_ADDRESS);
+  Wire.write(0xFF);
+  Wire.endTransmission();
+
+  return 'N';
+}
+
+// -------- SETUP --------
+void setup(){
+
+  Serial.begin(115200);
+
+  Wire.begin(21,22);
+
+  pinMode(BTN_OK,INPUT_PULLUP);
+  pinMode(BTN_CANCEL,INPUT_PULLUP);
+  pinMode(BTN_BACK,INPUT_PULLUP);
+  pinMode(BTN_NEXT,INPUT_PULLUP);
+
+  // OLED
+  display.begin(SSD1306_SWITCHCAPVCC,0x3C);
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  display.setTextSize(2);
+  display.setCursor(0,0);
+  display.println("REMOTE");
+  display.println("READY");
+  display.display();
+
+  WiFi.mode(WIFI_STA);
+
+  if(esp_now_init()!=ESP_OK){
+    Serial.println("ESP NOW INIT FAIL");
+    return;
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
+  esp_now_register_send_cb(OnDataSent);
+
+  esp_now_peer_info_t peerInfo={};
+  memcpy(peerInfo.peer_addr,machineMAC,6);
+  peerInfo.channel=0;
+  peerInfo.encrypt=false;
+
+  esp_now_add_peer(&peerInfo);
+}
+
+// -------- LOOP --------
+void loop(){
+
+  char key=readKeypad();
+
+  // -------- KEYPAD --------
+  if(key!='N' && key!=lastKey){
+
+    sendKey.key=key;
+
+    esp_now_send(machineMAC,(uint8_t*)&sendKey,sizeof(sendKey));
+
+    Serial.print("Send Keypad: ");
+    Serial.println(key);
+
+    delay(200);
+  }
+
+  // -------- BUTTONS --------
+
+  bool okState=digitalRead(BTN_OK);
+  bool cancelState=digitalRead(BTN_CANCEL);
+  bool backState=digitalRead(BTN_BACK);
+  bool nextState=digitalRead(BTN_NEXT);
+
+  // OK
+  if(okState==LOW && lastOkState==HIGH){
+
+    sendKey.key='#';
+    esp_now_send(machineMAC,(uint8_t*)&sendKey,sizeof(sendKey));
+    Serial.println("Send OK");
+  }
+
+  // CANCEL
+  if(cancelState==LOW && lastCancelState==HIGH){
+
+    sendKey.key='D';
+    esp_now_send(machineMAC,(uint8_t*)&sendKey,sizeof(sendKey));
+    Serial.println("Send CANCEL");
+  }
+
+  // BACK
+  if(backState==LOW && lastBackState==HIGH){
+
+    sendKey.key='*';
+    esp_now_send(machineMAC,(uint8_t*)&sendKey,sizeof(sendKey));
+    Serial.println("Send BACK");
+  }
+
+  // NEXT
+  if(nextState==LOW && lastNextState==HIGH){
+
+    sendKey.key='C';
+    esp_now_send(machineMAC,(uint8_t*)&sendKey,sizeof(sendKey));
+    Serial.println("Send NEXT");
+  }
+
+  lastOkState=okState;
+  lastCancelState=cancelState;
+  lastBackState=backState;
+  lastNextState=nextState;
+
+  lastKey=key;
+
+  delay(10);
+}

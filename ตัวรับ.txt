@@ -1,0 +1,482 @@
+// ==========================================
+// MACHINE RECEIVER
+// LCD + CUTTER + ESP NOW
+// ==========================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Stepper.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ---------------- LCD ----------------
+LiquidCrystal_I2C lcd(0x27,16,2);
+
+const uint8_t KEYPAD_ADDRESS = 0x20;
+const uint8_t BUTTON_ADDRESS = 0x38;
+
+// ---------------- Stepper ----------------
+#define SM_IN1 19
+#define SM_IN2 18
+#define SM_IN3 5
+#define SM_IN4 17
+
+const int stepsPerRevolution = 2048;
+Stepper myStepper(stepsPerRevolution,SM_IN1,SM_IN3,SM_IN2,SM_IN4);
+
+const float STEPS_PER_MM = 65.0;
+
+// ---------------- Servo ----------------
+#define SERVO_PIN 16
+Servo myServo;
+
+// ---------------- IR ----------------
+#define IR_SENSOR1 35
+#define IR_SENSOR2 32
+#define IR_SENSOR3 33
+
+// ---------------- ESP NOW ----------------
+
+uint8_t remoteMAC[] = {0xB0,0xCB,0xD8,0xC5,0xBB,0x20};
+
+typedef struct{
+char key;
+}KeyData;
+
+typedef struct{
+char line1[17];
+char line2[17];
+}DisplayData;
+
+KeyData remoteKeyData;
+DisplayData displayData;
+
+char remoteKey='N';
+
+// ---------- RECEIVE REMOTE KEY ----------
+
+void OnDataRecv(const esp_now_recv_info *info,const uint8_t *data,int len){
+
+memcpy(&remoteKeyData,data,sizeof(remoteKeyData));
+
+remoteKey = remoteKeyData.key;
+
+Serial.print("Remote Key: ");
+Serial.println(remoteKey);
+
+}
+
+// ---------- SEND DISPLAY TO REMOTE ----------
+
+void sendDisplay(String l1,String l2){
+
+l1.toCharArray(displayData.line1,17);
+l2.toCharArray(displayData.line2,17);
+
+esp_now_send(remoteMAC,(uint8_t*)&displayData,sizeof(displayData));
+
+}
+
+// ---------------- Keypad ----------------
+
+const uint8_t rowPins[4]={1,6,5,3};
+const uint8_t colPins[3]={2,0,4};
+
+const char keys[4][3]={
+{'1','2','3'},
+{'4','5','6'},
+{'7','8','9'},
+{'*','0','#'}
+};
+
+// ---------------- UI ----------------
+
+int uiState=0;
+
+String inputLength="";
+String inputQty="";
+
+char lastKey='N';
+
+bool lastBtnOk=HIGH;
+bool lastBtnCancel=HIGH;
+bool lastBtnBack=HIGH;
+bool lastBtnNext=HIGH;
+
+int lastTubeLevel=-1;
+
+unsigned long lastPress=0;
+
+// ------------------------------------------------
+
+void setup(){
+
+Serial.begin(115200);
+
+Wire.begin(21,22);
+
+// LCD
+lcd.init();
+lcd.backlight();
+
+// Button IC
+Wire.beginTransmission(BUTTON_ADDRESS);
+Wire.write(0xFF);
+Wire.endTransmission();
+
+// IR
+pinMode(IR_SENSOR1,INPUT);
+pinMode(IR_SENSOR2,INPUT);
+pinMode(IR_SENSOR3,INPUT);
+
+// Stepper
+myStepper.setSpeed(12);
+
+// Servo
+myServo.setPeriodHertz(50);
+myServo.attach(SERVO_PIN,400,2400);
+myServo.write(0);
+
+// ---------- ESP NOW ----------
+
+WiFi.mode(WIFI_STA);
+
+if(esp_now_init()!=ESP_OK){
+
+Serial.println("ESP NOW INIT FAIL");
+return;
+
+}
+
+esp_now_register_recv_cb(OnDataRecv);
+
+// add remote peer
+esp_now_peer_info_t peerInfo={};
+
+memcpy(peerInfo.peer_addr,remoteMAC,6);
+
+peerInfo.channel=0;
+peerInfo.encrypt=false;
+
+esp_now_add_peer(&peerInfo);
+
+Serial.println("MACHINE READY");
+
+updateDisplay();
+
+}
+
+// ------------------------------------------------
+
+int getTubeLevel(){
+
+int count=0;
+
+if(digitalRead(IR_SENSOR1)==LOW) count++;
+if(digitalRead(IR_SENSOR2)==LOW) count++;
+if(digitalRead(IR_SENSOR3)==LOW) count++;
+
+return count;
+
+}
+
+// ------------------------------------------------
+
+char readKeypad(){
+
+for(int r=0;r<4;r++){
+
+uint8_t writeByte=0xFF;
+
+writeByte&=~(1<<rowPins[r]);
+
+Wire.beginTransmission(KEYPAD_ADDRESS);
+Wire.write(writeByte);
+Wire.endTransmission();
+
+Wire.requestFrom((uint16_t)KEYPAD_ADDRESS,(uint8_t)1);
+
+if(Wire.available()){
+
+uint8_t readByte=Wire.read();
+
+for(int c=0;c<3;c++){
+
+if((readByte&(1<<colPins[c]))==0){
+
+Wire.beginTransmission(KEYPAD_ADDRESS);
+Wire.write(0xFF);
+Wire.endTransmission();
+
+delay(20);
+
+return keys[r][c];
+
+}
+
+}
+
+}
+
+}
+
+Wire.beginTransmission(KEYPAD_ADDRESS);
+Wire.write(0xFF);
+Wire.endTransmission();
+
+return 'N';
+
+}
+
+// ------------------------------------------------
+
+void updateDisplay(){
+
+lcd.clear();
+
+String line1="";
+String line2="";
+
+int tubeLvl=getTubeLevel();
+
+String tubeStr="";
+
+if(tubeLvl==3) tubeStr="Full";
+else if(tubeLvl==2) tubeStr="Mid";
+else if(tubeLvl==1) tubeStr="Low";
+else tubeStr="Emp";
+
+if(uiState==0){
+
+line1="Len(mm): "+tubeStr;
+line2="> "+inputLength;
+
+}
+
+else if(uiState==1){
+
+line1="Qty(pcs): "+tubeStr;
+line2="> "+inputQty;
+
+}
+
+else if(uiState==2){
+
+line1="L:"+inputLength+" Q:"+inputQty;
+line2="Press OK";
+
+}
+
+lcd.setCursor(0,0);
+lcd.print(line1);
+
+lcd.setCursor(0,1);
+lcd.print(line2);
+
+sendDisplay(line1,line2);
+
+}
+
+// ------------------------------------------------
+
+uint8_t readButtons(){
+
+Wire.requestFrom((uint16_t)BUTTON_ADDRESS,(uint8_t)1);
+
+if(Wire.available()){
+return Wire.read();
+}
+
+return 0xFF;
+
+}
+
+// ------------------------------------------------
+
+void loop(){
+
+// -------- tube level --------
+
+int currentTubeLevel=getTubeLevel();
+
+if(currentTubeLevel!=lastTubeLevel){
+
+lastTubeLevel=currentTubeLevel;
+
+updateDisplay();
+
+}
+
+// -------- keypad --------
+
+char customKey = readKeypad();
+
+if(remoteKey!='N'){
+
+customKey = remoteKey;
+remoteKey='N';
+
+}
+
+// -------- key process --------
+
+if(customKey!='N' && customKey!='E' && customKey!=lastKey
+&& millis()-lastPress>120){
+
+lastPress=millis();
+
+if(customKey>='0' && customKey<='9'){
+
+if(uiState==0 && inputLength.length()<4){
+
+inputLength+=customKey;
+updateDisplay();
+
+}
+
+else if(uiState==1 && inputQty.length()<4){
+
+inputQty+=customKey;
+updateDisplay();
+
+}
+
+}
+
+else if(customKey=='*'){
+
+if(uiState==0 && inputLength.length()>0){
+
+inputLength.remove(inputLength.length()-1);
+updateDisplay();
+
+}
+
+else if(uiState==1 && inputQty.length()>0){
+
+inputQty.remove(inputQty.length()-1);
+updateDisplay();
+
+}
+
+}
+
+}
+
+// -------- REMOTE BUTTONS --------
+
+if(customKey=='#'){   // OK
+
+if(uiState==1 && inputQty!=""){
+
+uiState=2;
+updateDisplay();
+
+}
+
+}
+
+else if(customKey=='D'){  // CANCEL
+
+inputLength="";
+inputQty="";
+uiState=0;
+
+updateDisplay();
+
+}
+
+else if(customKey=='C'){  // NEXT
+
+if(uiState==0 && inputLength!=""){
+
+uiState=1;
+updateDisplay();
+
+}
+
+}
+
+if(customKey=='N'){
+lastKey='N';
+}
+else{
+lastKey=customKey;
+}
+
+// -------- buttons --------
+
+uint8_t btnState = readButtons();
+
+bool curOk     = (btnState&(1<<0))?HIGH:LOW;
+bool curCancel = (btnState&(1<<1))?HIGH:LOW;
+bool curBack   = (btnState&(1<<2))?HIGH:LOW;
+bool curNext   = (btnState&(1<<3))?HIGH:LOW;
+
+if(lastBtnNext==HIGH && curNext==LOW){
+
+if(uiState==0){
+
+if(inputLength!=""){
+uiState=1;
+updateDisplay();
+}
+
+}
+
+delay(80);
+
+}
+
+if(lastBtnOk==HIGH && curOk==LOW){
+
+if(uiState==1){
+
+if(inputQty!=""){
+uiState=2;
+updateDisplay();
+}
+
+}
+
+delay(80);
+
+}
+
+if(lastBtnBack==HIGH && curBack==LOW){
+
+if(uiState==1){
+uiState=0;
+updateDisplay();
+}
+
+else if(uiState==2){
+uiState=1;
+updateDisplay();
+}
+
+delay(80);
+
+}
+
+if(lastBtnCancel==HIGH && curCancel==LOW){
+
+inputLength="";
+inputQty="";
+uiState=0;
+
+updateDisplay();
+
+delay(80);
+
+}
+
+lastBtnOk=curOk;
+lastBtnCancel=curCancel;
+lastBtnBack=curBack;
+lastBtnNext=curNext;
+
+delay(10);
+
+}
